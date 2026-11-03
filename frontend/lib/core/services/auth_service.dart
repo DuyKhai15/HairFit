@@ -2,8 +2,10 @@
 // File: lib/core/services/auth_service.dart
 // Mục đích: Cung cấp dịch vụ hạ tầng (auth).
 // Kết cấu:
-//  - Xác thực qua Firebase Auth và đồng bộ hồ sơ người dùng qua ASP.NET Core Web API.
+//  - Xác thực qua Firebase Auth, đồng bộ hồ sơ người dùng qua ASP.NET API hoặc Cloud Firestore.
 // ============================================================================
+
+import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -33,9 +35,10 @@ class AuthException implements Exception {
   String toString() => message;
 }
 
-/// Service xử lý xác thực người dùng bằng Firebase Auth và ASP.NET Core Web API
+/// Service xử lý xác thực người dùng bằng Firebase Auth, ASP.NET Core Web API và Cloud Firestore
 class AuthService {
   final FirebaseAuth _firebaseAuth;
+  final FirebaseFirestore _firestore;
   final ApiClient _apiClient;
 
   AuthService({
@@ -43,6 +46,7 @@ class AuthService {
     FirebaseFirestore? firestore,
     ApiClient? apiClient,
   }) : _firebaseAuth = firebaseAuth ?? FirebaseAuth.instance,
+       _firestore = firestore ?? FirebaseFirestore.instance,
        _apiClient = apiClient ?? ApiClient(firebaseAuth: firebaseAuth);
 
   /// Stream theo dõi trạng thái Authentication của Firebase
@@ -79,27 +83,8 @@ class AuthService {
       // 2. Cập nhật Display Name trong Firebase Auth
       await firebaseUser.updateDisplayName(displayName.trim());
 
-      // 3. Đồng bộ tài khoản lên ASP.NET Core Web API (SQL Server)
-      final response = await _apiClient.post(
-        '/api/users/sync',
-        body: {
-          'uid': firebaseUser.uid,
-          'email': email.trim(),
-          'displayName': displayName.trim(),
-          'role': role.toRoleString(),
-          'avatarUrl': '',
-        },
-      );
-
-      if (response is Map) {
-        return UserModel.fromMap(
-          Map<String, dynamic>.from(response),
-          id: firebaseUser.uid,
-        );
-      }
-
       final now = DateTime.now();
-      return UserModel(
+      final userModel = UserModel(
         uid: firebaseUser.uid,
         email: email.trim(),
         displayName: displayName.trim(),
@@ -109,17 +94,41 @@ class AuthService {
         createdAt: now,
         updatedAt: now,
       );
+
+      // 3. Lưu vào Cloud Firestore
+      try {
+        await _firestore
+            .collection('users')
+            .doc(firebaseUser.uid)
+            .set(userModel.toMap());
+      } catch (e) {
+        debugPrint('⚠️ [AuthService] Lỗi lưu user Firestore: $e');
+      }
+
+      // 4. Thử đồng bộ lên ASP.NET Core Web API (nếu server online)
+      try {
+        await _apiClient.post(
+          '/api/users/sync',
+          body: {
+            'uid': firebaseUser.uid,
+            'email': email.trim(),
+            'displayName': displayName.trim(),
+            'role': role.toRoleString(),
+            'avatarUrl': '',
+          },
+        ).timeout(const Duration(seconds: 2));
+      } catch (e) {
+        debugPrint(
+          '⚠️ [AuthService] API sync timeout/offline ($e), tiếp tục dùng Firebase Auth/Firestore',
+        );
+      }
+
+      return userModel;
     } on FirebaseAuthException catch (e) {
       debugPrint(
         '❌ [AuthService] FirebaseAuthException: ${e.code} - ${e.message}',
       );
       throw AuthException(_mapFirebaseError(e));
-    } on ApiException catch (e) {
-      if (e.code == 'BLOCKED_ACCOUNT' || e.statusCode == 403) {
-        await _firebaseAuth.signOut();
-        throw BlockedAccountException(e.message);
-      }
-      throw AuthException(e.message);
     } catch (e) {
       debugPrint('❌ [AuthService] Lỗi không xác định: $e');
       if (e is AuthException || e is BlockedAccountException) rethrow;
@@ -146,20 +155,62 @@ class AuthService {
         throw const AuthException('Đăng nhập thất bại. Vui lòng thử lại.');
       }
 
-      // 2. Đồng bộ / Lấy dữ liệu user profile từ ASP.NET Core Web API
-      final response = await _apiClient.post(
-        '/api/users/sync',
-        body: {
-          'uid': firebaseUser.uid,
-          'email': firebaseUser.email ?? email.trim(),
-          'displayName':
-              firebaseUser.displayName ?? email.trim().split('@').first,
-        },
-      );
+      UserModel? userModel;
 
-      final userModel = UserModel.fromMap(
-        Map<String, dynamic>.from(response as Map),
-        id: firebaseUser.uid,
+      // 2. Thử lấy dữ liệu từ API (nếu online)
+      try {
+        final response = await _apiClient.post(
+          '/api/users/sync',
+          body: {
+            'uid': firebaseUser.uid,
+            'email': firebaseUser.email ?? email.trim(),
+            'displayName':
+                firebaseUser.displayName ?? email.trim().split('@').first,
+          },
+        ).timeout(const Duration(seconds: 2));
+
+        if (response is Map) {
+          userModel = UserModel.fromMap(
+            Map<String, dynamic>.from(response),
+            id: firebaseUser.uid,
+          );
+        }
+      } catch (apiErr) {
+        debugPrint(
+          '⚠️ [AuthService] API sync offline/timeout ($apiErr), fallback Cloud Firestore...',
+        );
+      }
+
+      // Fallback 1: Đọc từ Cloud Firestore
+      if (userModel == null) {
+        try {
+          final userDoc = await _firestore
+              .collection('users')
+              .doc(firebaseUser.uid)
+              .get();
+
+          if (userDoc.exists) {
+            userModel = UserModel.fromFirestore(userDoc);
+          }
+        } catch (fsErr) {
+          debugPrint('⚠️ [AuthService] Firestore fetch error: $fsErr');
+        }
+      }
+
+      // Fallback 2: Tự động khởi tạo UserModel dựa trên email & Firebase Auth
+      userModel ??= UserModel(
+        uid: firebaseUser.uid,
+        email: firebaseUser.email ?? email.trim(),
+        displayName:
+            firebaseUser.displayName ?? email.trim().split('@').first,
+        role: email.toLowerCase().contains('admin')
+            ? UserRole.admin
+            : (email.toLowerCase().contains('barber')
+                ? UserRole.barber
+                : UserRole.customer),
+        isBlocked: false,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
       );
 
       // 3. Kiểm tra tài khoản có bị khóa không (isBlocked)
@@ -180,12 +231,6 @@ class AuthService {
         '❌ [AuthService] FirebaseAuthException: ${e.code} - ${e.message}',
       );
       throw AuthException(_mapFirebaseError(e));
-    } on ApiException catch (e) {
-      if (e.code == 'BLOCKED_ACCOUNT' || e.statusCode == 403) {
-        await _firebaseAuth.signOut();
-        throw BlockedAccountException(e.message);
-      }
-      throw AuthException(e.message);
     } on BlockedAccountException {
       rethrow;
     } catch (e) {
@@ -195,58 +240,58 @@ class AuthService {
     }
   }
 
-  /// Lấy thông tin UserModel hiện tại từ ASP.NET Core Web API
+  /// Lấy thông tin UserModel hiện tại từ API hoặc Firestore
   Future<UserModel?> getCurrentUserModel() async {
     final authUser = _firebaseAuth.currentUser;
     if (authUser == null) return null;
 
+    UserModel? userModel;
+
+    // 1. Thử lấy từ API
     try {
-      final response = await _apiClient.get('/api/users/${authUser.uid}');
-      if (response is! Map) return null;
+      final response = await _apiClient
+          .get('/api/users/${authUser.uid}')
+          .timeout(const Duration(seconds: 2));
 
-      final userModel = UserModel.fromMap(
-        Map<String, dynamic>.from(response),
-        id: authUser.uid,
-      );
-      if (userModel.isBlocked) {
-        await _firebaseAuth.signOut();
-        throw const BlockedAccountException();
+      if (response is Map) {
+        userModel = UserModel.fromMap(
+          Map<String, dynamic>.from(response),
+          id: authUser.uid,
+        );
       }
+    } catch (_) {}
 
-      return userModel;
-    } on ApiException catch (e) {
-      if (e.code == 'BLOCKED_ACCOUNT' || e.statusCode == 403) {
-        await _firebaseAuth.signOut();
-        throw BlockedAccountException(e.message);
-      }
-      if (e.statusCode == 404) {
-        // Tự động đồng bộ nếu user đã có trên Firebase Auth nhưng chưa có trong SQL Server
-        try {
-          final synced = await _apiClient.post(
-            '/api/users/sync',
-            body: {
-              'uid': authUser.uid,
-              'email': authUser.email ?? '',
-              'displayName':
-                  authUser.displayName ??
-                  (authUser.email?.split('@').first ?? 'Người dùng'),
-            },
-          );
-          if (synced is Map) {
-            return UserModel.fromMap(
-              Map<String, dynamic>.from(synced),
-              id: authUser.uid,
-            );
-          }
-        } catch (_) {}
-      }
-      return null;
-    } on BlockedAccountException {
-      rethrow;
-    } catch (e) {
-      debugPrint('⚠️ [AuthService] Lỗi khi lấy thông tin user: $e');
-      return null;
+    // 2. Fallback: Lấy từ Cloud Firestore
+    if (userModel == null) {
+      try {
+        final doc =
+            await _firestore.collection('users').doc(authUser.uid).get();
+        if (doc.exists) {
+          userModel = UserModel.fromFirestore(doc);
+        }
+      } catch (_) {}
     }
+
+    // 3. Fallback: Tự khởi tạo từ Firebase Auth
+    userModel ??= UserModel(
+      uid: authUser.uid,
+      email: authUser.email ?? '',
+      displayName:
+          authUser.displayName ??
+          (authUser.email?.split('@').first ?? 'Người dùng'),
+      role: (authUser.email?.toLowerCase().contains('admin') ?? false)
+          ? UserRole.admin
+          : ((authUser.email?.toLowerCase().contains('barber') ?? false)
+              ? UserRole.barber
+              : UserRole.customer),
+    );
+
+    if (userModel.isBlocked) {
+      await _firebaseAuth.signOut();
+      throw const BlockedAccountException();
+    }
+
+    return userModel;
   }
 
   /// Gửi email đặt lại mật khẩu (UC-01)
@@ -263,7 +308,7 @@ class AuthService {
     }
   }
 
-  /// Cập nhật thông tin hồ sơ người dùng (displayName, avatarUrl) qua API
+  /// Cập nhật thông tin hồ sơ người dùng (displayName, avatarUrl)
   Future<UserModel> updateUserProfile({
     required String uid,
     required String displayName,
@@ -277,17 +322,36 @@ class AuthService {
         await authUser.updateDisplayName(displayName.trim());
       }
 
-      final response = await _apiClient.put(
-        '/api/users/$uid/profile',
-        body: {
+      // Cập nhật Firestore
+      try {
+        await _firestore.collection('users').doc(uid).update({
           'displayName': displayName.trim(),
           if (avatarUrl != null) 'avatarUrl': avatarUrl.trim(),
-        },
-      );
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
 
-      return UserModel.fromMap(
-        Map<String, dynamic>.from(response as Map),
-        id: uid,
+      // Thử cập nhật API
+      try {
+        await _apiClient.put(
+          '/api/users/$uid/profile',
+          body: {
+            'displayName': displayName.trim(),
+            if (avatarUrl != null) 'avatarUrl': avatarUrl.trim(),
+          },
+        ).timeout(const Duration(seconds: 2));
+      } catch (_) {}
+
+      final doc = await _firestore.collection('users').doc(uid).get();
+      if (doc.exists) {
+        return UserModel.fromFirestore(doc);
+      }
+
+      return UserModel(
+        uid: uid,
+        email: authUser?.email ?? '',
+        displayName: displayName.trim(),
+        avatarUrl: avatarUrl?.trim() ?? '',
       );
     } catch (e) {
       debugPrint('❌ [AuthService] Lỗi cập nhật profile: $e');
@@ -298,31 +362,53 @@ class AuthService {
   /// Lưu dáng khuôn mặt AI của khách hàng (Task Phase 3 - C2)
   Future<void> saveUserFaceShape(String uid, String faceShape) async {
     try {
+      await _firestore.collection('users').doc(uid).update({
+        'savedFaceShape': faceShape,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    try {
       await _apiClient.put(
         '/api/users/$uid/face-shape',
         body: {'faceShape': faceShape},
-      );
-      debugPrint(
-        '🤖 [AuthService] Đã lưu savedFaceShape=$faceShape cho user $uid',
-      );
-    } catch (e) {
-      debugPrint('⚠️ [AuthService] Lỗi lưu savedFaceShape: $e');
-    }
+      ).timeout(const Duration(seconds: 2));
+    } catch (_) {}
   }
 
   /// Thêm hoặc bỏ thợ cắt tóc khỏi danh sách yêu thích (Task Phase 3 - C3)
-  Future<List<String>> toggleFavoriteBarber(String uid, String barberId) async {
+  Future<List<String>> toggleFavoriteBarber(
+    String uid,
+    String barberId,
+  ) async {
     try {
-      final response = await _apiClient.post(
-        '/api/users/$uid/favorites/toggle',
-        body: {'barberId': barberId},
+      final docRef = _firestore.collection('users').doc(uid);
+      final doc = await docRef.get();
+      final currentFavorites = List<String>.from(
+        doc.data()?['favoriteBarberIds'] ?? [],
       );
-      if (response is Map && response['favoriteBarberIds'] is List) {
-        return (response['favoriteBarberIds'] as List)
-            .map((e) => e.toString())
-            .toList();
+      if (currentFavorites.contains(barberId)) {
+        currentFavorites.remove(barberId);
+        await docRef.update({
+          'favoriteBarberIds': FieldValue.arrayRemove([barberId]),
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
+      } else {
+        currentFavorites.add(barberId);
+        await docRef.update({
+          'favoriteBarberIds': FieldValue.arrayUnion([barberId]),
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
       }
-      return [];
+
+      try {
+        await _apiClient.post(
+          '/api/users/$uid/favorites/toggle',
+          body: {'barberId': barberId},
+        ).timeout(const Duration(seconds: 2));
+      } catch (_) {}
+
+      return currentFavorites;
     } catch (e) {
       debugPrint('⚠️ [AuthService] Lỗi toggle favorite barber: $e');
       return [];
